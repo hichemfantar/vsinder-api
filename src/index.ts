@@ -13,7 +13,7 @@ import { assert } from "superstruct";
 import { createConnection, getConnection } from "typeorm";
 import { createTokens } from "./auth/createTokens";
 import { isAuth } from "./auth/isAuth";
-import { __prod__ } from "./constants";
+import { activeSwipesMax, __prod__ } from "./constants";
 import { Match } from "./entities/Match";
 import { Message } from "./entities/Message";
 import { User } from "./entities/User";
@@ -47,8 +47,10 @@ import {
   IRateLimiterStoreOptions,
 } from "rate-limiter-flexible";
 import { rateLimitMiddleware } from "./rateLimitMiddleware";
+import { resetNumSwipesDaily } from "./resetNumSwipesDaily";
+import isUuid from "is-uuid";
 
-const SECONDS_IN_A_DAY = 86400;
+const SECONDS_IN_A_HALF_A_DAY = 86400 / 2;
 
 const main = async () => {
   const conn = await createConnection({
@@ -71,10 +73,11 @@ const main = async () => {
   const defaultRateLimitOpts: IRateLimiterStoreOptions = {
     storeClient: redisClient,
     execEvenly: false,
-    blockDuration: SECONDS_IN_A_DAY,
+    blockDuration: SECONDS_IN_A_HALF_A_DAY,
   };
 
   startPushNotificationRunner();
+  resetNumSwipesDaily();
 
   const wsUsers: Record<
     string,
@@ -258,9 +261,13 @@ const main = async () => {
       const { rn } = JSON.parse(Buffer.from(state, "base64").toString());
       if (rn) {
         res.redirect(
-          `${__prod__ ? `vsinder://` : `exp://127.0.0.1:19000/`}tokens/${
-            req.user.accessToken
-          }/${req.user.refreshToken}`
+          `${
+            __prod__
+              ? `vsinder://`
+              : `exp:${
+                  process.env.SERVER_URL.replace("http:", "").split(":")[0]
+                }:19005/--/`
+          }tokens/${req.user.accessToken}/${req.user.refreshToken}`
         );
       } else {
         res.redirect(
@@ -277,7 +284,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 100,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/user/imgs/",
       })
     ),
@@ -302,7 +309,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 20,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/user/push-token/",
       })
     ),
@@ -327,7 +334,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 100,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/user/",
       })
     ),
@@ -353,6 +360,36 @@ const main = async () => {
     }
   );
 
+  const MS_IN_HOUR = 1000 * 60 * 60;
+  const cache: Record<string, { data: any; date: Date }> = {};
+  router.get("/leaderboard/:category?", async (req, res, next) => {
+    let { category } = req.params;
+    if (!category) {
+      category = "overall";
+    }
+
+    if (category !== "overall" && category !== "male") {
+      next(createError(400, "invalid category"));
+      return;
+    }
+
+    if (
+      !(category in cache) ||
+      new Date().getTime() - cache[category].date.getTime() > MS_IN_HOUR
+    ) {
+      const data = await getConnection().query(`
+      select u.id, flair, "numLikes", "displayName", date_part('year', age(birthday)) "age", bio, "codeImgIds", "photoUrl"
+      from "user" u
+      ${category === "male" ? `where gender = 'male'` : ""}
+      order by u."numLikes" DESC
+      limit 10
+      `);
+      cache[category] = { data, date: new Date() };
+    }
+
+    res.send({ profiles: cache[category].data });
+  });
+
   router.get(
     "/feed",
     isAuth(),
@@ -360,7 +397,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 500,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/feed/",
       }),
       "You've been using the app too much and hit the rate limit, come back tomorrow"
@@ -386,7 +423,7 @@ const main = async () => {
       const paramNum = user.global ? 6 : 4;
       const loveWhere = `
         and goal = 'love'
-        and "genderToShow" = $${paramNum}
+        and ("genderToShow" = 'everyone' or "genderToShow" = $${paramNum})
         and $${paramNum + 1} <= date_part('year', age(birthday))
         and $${paramNum + 2} >= date_part('year', age(birthday))
         and "ageRangeMin" <= $${paramNum + 3}
@@ -424,7 +461,7 @@ const main = async () => {
 
       const profiles = await getConnection().query(
         `
-        select id, flair, "displayName", date_part('year', age(birthday)) "age", bio, "codeImgIds", "photoUrl"
+        select u.id, flair, "displayName", date_part('year', age(birthday)) "age", bio, "codeImgIds", "photoUrl"
         from "user" u
         left join view v on v."viewerId" = $1 and u.id = v."targetId"
         left join view v2 on $2 = v2."targetId" and v2.liked = true and u.id = v2."viewerId"
@@ -435,22 +472,22 @@ const main = async () => {
         and array_length("codeImgIds", 1) >= 1
         and "shadowBanned" != true
         order by
-          case
-                ${
-                  user.goal === "love" && user.global
-                    ? `
-                when (u.location = $4 and v2 is not null)
-                then random() - 1.2
-                when (u.location = $5)
-                then random() - 1
-                `
-                    : ""
-                }
-                when (v2 is not null)
-                then random() - .2
-                else random()
-              end
-            limit 20;
+          (case
+            ${
+              user.goal === "love" && user.global
+                ? `
+            when (u.location = $4 and v2 is not null)
+            then random() - 1.2
+            when (u.location = $5)
+            then random() - 1
+            `
+                : ""
+            }
+            when (v2 is not null)
+            then random() - .2
+            else random()
+          end) - u."numSwipes" / ${activeSwipesMax}
+        limit 20;
         `,
         user.goal === "love" ? loveParams : friendParams
       );
@@ -468,7 +505,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 500,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/matches/",
       }),
       "You've been using the app too much and hit the rate limit, come back tomorrow"
@@ -564,7 +601,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 100,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/unmatch/",
       })
     ),
@@ -592,7 +629,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 100,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/report/",
       })
     ),
@@ -668,7 +705,14 @@ const main = async () => {
                       type: "image",
                       title: {
                         type: "plain_text",
-                        text: u.displayName + " | " + u.photoUrl,
+                        text:
+                          u.displayName +
+                          " | " +
+                          u.gender +
+                          " | " +
+                          u.bio +
+                          " | " +
+                          u.photoUrl,
                         emoji: true,
                       },
                       image_url: u.photoUrl,
@@ -706,7 +750,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 1000,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/message/",
       })
     ),
@@ -715,6 +759,13 @@ const main = async () => {
         assert(req.body, MessageStruct);
       } catch (err) {
         next(createError(400, err.message));
+        return;
+      }
+
+      if (
+        !(await Match.findOne(getUserIdOrder(req.userId, req.body.recipientId)))
+      ) {
+        next(createError(400, "you got unmatched"));
         return;
       }
 
@@ -755,12 +806,12 @@ const main = async () => {
     rateLimitMiddleware(
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
-        points: 100,
-        duration: SECONDS_IN_A_DAY,
+        points: 500,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         blockDuration: 0,
         keyPrefix: "rl/view/",
       }),
-      `You've hit the rate limit of 100 swipes a day, come back in 24 hours`
+      `You've hit the rate limit of 500 swipes a day, come back tomorrow`
     ),
     async (req: any, res, next) => {
       try {
@@ -834,6 +885,10 @@ const main = async () => {
         User.update(userId, { numLikes: () => '"numLikes" + 1' });
         wsSend(userId, { type: "new-like" });
       }
+
+      User.update(req.userId, {
+        numSwipes: () => `LEAST("numSwipes" + 1, ${activeSwipesMax})`,
+      });
     }
   );
 
@@ -844,7 +899,7 @@ const main = async () => {
       new RateLimiterRedis({
         ...defaultRateLimitOpts,
         points: 200,
-        duration: SECONDS_IN_A_DAY,
+        duration: SECONDS_IN_A_HALF_A_DAY,
         keyPrefix: "rl/user/:id",
       })
     ),
@@ -862,16 +917,16 @@ const main = async () => {
 
       const [user] = await getConnection().query(
         `
-    select id, flair, "displayName", date_part('year', age(birthday)) "age", bio, "codeImgIds", "photoUrl"
+    select u.id, flair, "displayName", date_part('year', age(birthday)) "age", bio, "codeImgIds", "photoUrl"
     ${
       isMe
         ? `
     from "user" u
-    where  id = $1
+    where  u.id = $1
     `
         : `
     from "user" u, match m
-    where  m."userId1" = $1 and m."userId2" = $2 and id = $3
+    where  m."userId1" = $1 and m."userId2" = $2 and u.id = $3
     `
     }
     `,
@@ -883,6 +938,16 @@ const main = async () => {
       });
     }
   );
+
+  router.post("/account/delete", isAuth(), async (req: any, res) => {
+    if (isUuid.v4(req.userId)) {
+      await User.delete(req.userId);
+    }
+
+    res.json({
+      ok: true,
+    });
+  });
 
   router.get("/me", isAuth(false), async (req: any, res) => {
     if (!req.userId) {
